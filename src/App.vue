@@ -60,6 +60,7 @@ onMounted(store.refresh)
           <h2>{{ navs.find(n => n.k === view)?.label }}</h2>
           <span class="halo" v-if="store.activeEvents.length">{{ store.activeEvents.length }} 个待处理事件</span>
           <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
+          <span class="halo" v-if="store.maintenanceStats.queued">🛠️ {{ store.maintenanceStats.queued }} 张检修工单待接单</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
         </div>
         <div class="stats">

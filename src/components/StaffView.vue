@@ -53,7 +53,10 @@ function hire() {
         <span>Lv.{{ s.skill }}</span>
         <span><div class="hb"><i :style="{width:s.morale+'%',background:s.morale>60?'var(--green)':s.morale>40?'var(--accent2)':'var(--red)'}"></i></div>{{ s.morale }}</span>
         <span class="money neg">¥{{ s.wage }}</span>
-        <span><i class="dot" :class="s.active?'on':'off'"></i>{{ s.active ? '在岗' : '已辞退' }}</span>
+        <span>
+          <i class="dot" :class="s.active?'on':'off'"></i>{{ s.active ? '在岗' : '已辞退' }}
+          <em class="load" v-if="s.active && s.role==='维修'">{{ s.maint_load ? `🔧 检修中 ×${s.maint_load}` : '空闲可接单' }}</em>
+        </span>
         <span>
           <button class="ghost" @click="s.active ? store.updateStaff(s.id,{active:0}) : store.updateStaff(s.id,{active:1})">{{ s.active ? '解雇' : '返聘' }}</button>
         </span>
@@ -81,5 +84,6 @@ function hire() {
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
 .dot.on { background: var(--green); }
 .dot.off { background: var(--red); }
+.load { display: block; font-size: 11px; color: var(--accent2); margin-top: 3px; font-style: normal; }
 .empty { padding: 16px; text-align: center; }
 </style>

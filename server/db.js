@@ -218,6 +218,39 @@ CREATE TABLE IF NOT EXISTS reservation_logs (
   note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_reservation_logs_rid ON reservation_logs(reservation_id);
+
+-- 设施检修工单：报修后进入排队，维修员工接单后按游戏时间推进，支持转派与离岗接续
+CREATE TABLE IF NOT EXISTS maintenance_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',           -- 工单号 WX0001
+  ride_id INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',   -- queued 排队待接单 / processing 检修中 / done 已完工 / cancelled 已撤销
+  source TEXT NOT NULL DEFAULT 'manual',   -- manual 人工报修 / auto 故障自动停运 / system 兼容既有检修状态补建
+  assignee_id INTEGER,                     -- 接单维修员工
+  progress REAL NOT NULL DEFAULT 0,        -- 检修进度 0-100，按游戏小时推进
+  cost INTEGER NOT NULL DEFAULT 0,         -- 检修费用（报修时按健康度核定，完工结算入账）
+  create_tick INTEGER NOT NULL,
+  create_day INTEGER NOT NULL,
+  start_tick INTEGER NOT NULL DEFAULT 0,   -- 最近一次接单/转派到手时刻
+  completed_tick INTEGER NOT NULL DEFAULT 0,
+  completed_day INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_maint_ride ON maintenance_orders(ride_id);
+CREATE INDEX IF NOT EXISTS idx_maint_status ON maintenance_orders(status);
+CREATE INDEX IF NOT EXISTS idx_maint_assignee ON maintenance_orders(assignee_id);
+
+CREATE TABLE IF NOT EXISTS maintenance_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,                    -- create/assign/transfer/release/complete/cancel
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_maint_logs_oid ON maintenance_logs(order_id);
 `)
 
 const now = () => new Date().toISOString()

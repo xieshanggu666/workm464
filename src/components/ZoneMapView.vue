@@ -85,10 +85,11 @@ const selVendor = computed(() => selected.value ? store.vendors.find(v => v.id =
           <div><em class="muted">每日运营成本</em><b class="money neg">{{ selRide.run_cost }}</b></div>
         </div>
         <div class="acts">
-          <button :class="selRide.status==='operating'?'danger':''" @click="store.updateRide(selRide.id,{status: selRide.status==='operating'?'closed':'operating'})">
+          <button v-if="!selRide.maint_status" :class="selRide.status==='operating'?'danger':''" @click="store.updateRide(selRide.id,{status: selRide.status==='operating'?'closed':'operating'})">
             {{ selRide.status === 'operating' ? '关闭' : '重新开放' }}
           </button>
-          <button v-if="selRide.status !== 'operating'" @click="store.updateRide(selRide.id,{repair:1})">检修(5千)</button>
+          <button v-if="selRide.maint_status" disabled>检修工单进行中</button>
+          <button v-if="selRide.status !== 'operating' && !selRide.maint_status" @click="store.updateRide(selRide.id,{repair:1})">报修检修</button>
           <button @click="store.updateRide(selRide.id,{upgrade:10})">升级刺激度(3万)</button>
           <button @click="store.delRide(selRide.id)">拆除</button>
           <button class="ghost" @click="selected=null">关闭</button>

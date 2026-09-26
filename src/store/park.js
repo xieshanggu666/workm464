@@ -37,6 +37,9 @@ export const useParkStore = defineStore('park', {
     debt: s => s.data?.debt || { remainPrincipal: 0, arrears: 0, overdueCount: 0 },
     complaints: s => s.data?.complaints || [],
     complaintStats: s => s.data?.complaintStats || { open: 0, overdue: 0, todayClosed: 0, resolved: 0, total: 0, avgRating: 0, compTotal: 0 },
+    maintenanceOrders: s => s.data?.maintenanceOrders || [],
+    maintenanceStats: s => s.data?.maintenanceStats || { queued: 0, processing: 0, open: 0, doneToday: 0, costToday: 0 },
+    openMaintenanceOrders: s => (s.data?.maintenanceOrders || []).filter(o => ['queued', 'processing'].includes(o.status)),
     wordOfMouth: s => s.data?.wordOfMouth ?? 0,
     entrySlots: s => s.data?.entrySlots || [],
     reservations: s => s.data?.reservations || [],
@@ -83,6 +86,10 @@ export const useParkStore = defineStore('park', {
     checkinReservation(id) { return this.api('POST', `/reservations/${id}/checkin`, {}) },
     updateSlot(id, payload) { return this.api('POST', `/reservation-slots/${id}`, payload) },
     async rideSlots(rideId, day) { return j('GET', `/reservation-slots?scope=ride&rideId=${rideId}${day ? `&day=${day}` : ''}`) },
-    async reservationDetail(id) { return j('GET', `/reservations/${id}`) }
+    async reservationDetail(id) { return j('GET', `/reservations/${id}`) },
+    // 设施检修工单
+    assignMaintenance(id, staff_id) { return this.api('POST', `/maintenance/${id}/assign`, { staff_id }) },
+    cancelMaintenance(id) { return this.api('POST', `/maintenance/${id}/cancel`, {}) },
+    async maintenanceDetail(id) { return j('GET', `/maintenance/${id}`) }
   }
 })

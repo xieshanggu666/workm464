@@ -7,6 +7,12 @@ import {
   listSlots, listReservations, reservationLogs, updateSlot, reservationStats,
   refundReservation
 } from './reservations.js'
+import {
+  initMaintenanceContext, backfillMaintenanceOrders, processMaintenance,
+  createMaintenanceOrder, assignMaintenanceOrder, cancelMaintenanceOrder,
+  cancelOrdersByRide, releaseStaffOrders, listMaintenanceOrders,
+  maintenanceOrderDetail, maintenanceStats, staffLoad
+} from './maintenance.js'
 
 const app = express()
 app.use(express.json())
@@ -53,6 +59,13 @@ function logFinance(day, label, amount, detail) {
 initReservationContext({
   logFinance,
   createComplaint: (payload) => createComplaint(payload)
+})
+
+// 检修工单模块共享：时钟 / 现金 / 财务流水 / 停运时段联动 / 完工联动设施类投诉
+initMaintenanceContext({
+  logFinance,
+  syncRideSlots: (ride) => syncRideSlots(ride),
+  linkComplaintsToRide: (rideId, staffId) => linkComplaintsToRide(rideId, staffId)
 })
 
 // ---------------- 分期贷款 ----------------
@@ -372,6 +385,26 @@ function forceCloseComplaint(id) {
   return { ok: true }
 }
 
+// 检修完工联动：维修工在现场可一并处置针对该设施的「设施故障」投诉
+// 待受理的同设施设施类投诉由其接手并记 40% 处置进度；已由其本人推进的直接完成现场处置待补偿
+function linkComplaintsToRide(rideId, staffId) {
+  if (!staffId) return
+  const st = db.prepare('SELECT * FROM staff WHERE id=?').get(staffId)
+  if (!st || !st.active) return
+  const rows = db.prepare(`SELECT * FROM complaints WHERE category='facility' AND target_type='ride' AND target_id=?
+                           AND status IN ('open','processing')`).all(rideId)
+  for (const c of rows) {
+    if (c.status === 'processing' && c.assignee_id === staffId) {
+      db.prepare('UPDATE complaints SET status=?, progress=100, resolved_tick=? WHERE id=?')
+        .run('ready', state.tick(), c.id)
+      logComplaint(c.id, 'ready', `${st.name} 随设施检修完工一并完成现场处置，等待补偿确认`, staffId)
+    } else if (c.status === 'open') {
+      db.prepare("UPDATE complaints SET status='processing', assignee_id=?, progress=40 WHERE id=?").run(staffId, c.id)
+      logComplaint(c.id, 'assign', `设施检修完工，${st.name} 现场接手处置该故障投诉`, staffId)
+    }
+  }
+}
+
 function enrichComplaints(rows) {
   const tick = state.tick()
   const rides = allRides(), vendors = allVendors(), zones = allZones()
@@ -557,6 +590,9 @@ function tick() {
   // 投诉处置：推进受理进度，超时自动升级 / 公开差评，返回本时段声誉扣分
   const complaintPenalty = processComplaints()
 
+  // 设施检修工单：维修员工接单后按游戏时间推进，离岗退回排队，完工恢复运营并结算费用
+  processMaintenance()
+
   // 声誉演化：满意度+事件+预算健康度+超时投诉
   const budgetHealth = cash > 0 ? Math.min(1, cash / 200000) : -0.4
   rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift - complaintPenalty))
@@ -632,18 +668,18 @@ function maybeSpawnEvent(day) {
 }
 
 function checkBrokenDown(day) {
+  // 健康度跌破红线：自动停运并生成检修工单（进入排队，待维修员工接单）
+  // 停运联动在工单创建时完成（关停时段、在途预约园方全额退款、生成投诉）
   const bad = db.prepare("SELECT * FROM rides WHERE health<25 AND status='operating'").all()
   for (const r of bad) {
-    db.prepare("UPDATE rides SET status='maintenance' WHERE id=?").run(r.id)
-    // 停运联动：关闭未来时段并对在途预约园方全额退款（生成投诉）
-    syncRideSlots({ ...r, status: 'maintenance' })
-  }
-  const sound = db.prepare("SELECT * FROM rides WHERE health>95 AND status='maintenance'").all()
-  for (const r of sound) {
-    db.prepare("UPDATE rides SET status='operating' WHERE id=?").run(r.id)
-    syncRideSlots({ ...r, status: 'operating' })
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(state.tick(), day, 'fault', '设备突发故障', `「${r.name}」健康度过低已自动停运，检修工单已进入维修队列，请尽快安排维修工接单。`, -1, 'active')
+    createMaintenanceOrder(r.id, 'auto')
   }
 }
+
+// 兼容既有检修状态：为已停运检修但无在途工单的设施补建排队工单
+backfillMaintenanceOrders()
 
 // 启动循环
 tick()
@@ -651,7 +687,11 @@ setInterval(tick, TICK_MS)
 
 // ---------------- API ----------------
 app.get('/api/state', (req, res) => {
-  const rides = allRides()
+  const rides = allRides().map(r => {
+    const mo = db.prepare(`SELECT * FROM maintenance_orders WHERE ride_id=? AND status IN ('queued','processing') ORDER BY id DESC LIMIT 1`).get(r.id)
+    return mo ? { ...r, maint_order_id: mo.id, maint_status: mo.status } : r
+  })
+  const loadMap = staffLoad()
   const visitors = db.prepare('SELECT * FROM visitors ORDER BY id DESC LIMIT 60').all().reverse()
   const fin = db.prepare('SELECT * FROM finance ORDER BY id DESC LIMIT 80').all().reverse()
   const loans = activeLoans().map(l => {
@@ -682,7 +722,9 @@ app.get('/api/state', (req, res) => {
     zones: allZones(),
     rides,
     vendors: allVendors(),
-    staff: allStaff(),
+    staff: allStaff().map(s => ({ ...s, maint_load: loadMap.get(s.id) || 0 })),
+    maintenanceOrders: listMaintenanceOrders({ limit: 100 }),
+    maintenanceStats: maintenanceStats(),
     events: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 40').all(),
     complaints: enrichComplaints(db.prepare('SELECT * FROM complaints ORDER BY id DESC LIMIT 60').all()),
     complaintStats: complaintStats(),
@@ -735,9 +777,24 @@ app.post('/api/rides', (req, res) => {
 app.post('/api/rides/:id', (req, res) => {
   const id = num(req.params.id)
   const b = req.body || {}
+
+  // 检修：不再即时修复，改为创建检修工单（排队待维修员工接单，按游戏时间推进，完工结算恢复）
+  if (b.repair) {
+    const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
+    if (!ride) return res.status(404).json({ ok: false, msg: '设施不存在' })
+    const r = createMaintenanceOrder(id, 'manual')
+    if (!r.ok) return res.status(400).json(r)
+    return res.json(r)
+  }
+
   const sets = []
   const vals = []
-  if (b.status) { sets.push('status=?'); vals.push(b.status) }
+  if (b.status) {
+    // 在途检修工单期间不允许直接改运营状态：完工自动恢复，需撤销请先撤销工单
+    const openOrder = db.prepare("SELECT id FROM maintenance_orders WHERE ride_id=? AND status IN ('queued','processing')").get(id)
+    if (openOrder) return res.status(400).json({ ok: false, msg: '该设施有在途检修工单，工单完工后自动恢复运营' })
+    sets.push('status=?'); vals.push(b.status)
+  }
   if (b.price) { sets.push('price=?'); vals.push(num(b.price)) }
   if (b.name) { sets.push('name=?'); vals.push(b.name) }
   if (b.thrill && b.upgrade) {
@@ -751,23 +808,11 @@ app.post('/api/rides/:id', (req, res) => {
     setSetting('cash', Math.round(cash))
     logFinance(state.day(), '升级', -cost, `升级设施 #${id}`)
   }
-  if (b.repair) {
-    sets.push("health=? , status='operating'"); vals.push(100)
-    let cash = state.cash()
-    const cost = 5000
-    cash -= cost
-    setSetting('cash', Math.round(cash))
-    logFinance(state.day(), '维护', -cost, `检修设施 #${id}`)
-  }
   if (!sets.length) return res.json({ ok: false, msg: '无更新项' })
   vals.push(id)
   db.prepare(`UPDATE rides SET ${sets.join(',')} WHERE id=?`).run(...vals)
   // 设施开放/停运联动分时预约：停运强制退款在途预约，恢复重新开放时段
   if (b.status) {
-    const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
-    syncRideSlots(ride)
-  }
-  if (b.repair) {
     const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
     syncRideSlots(ride)
   }
@@ -781,6 +826,8 @@ app.delete('/api/rides/:id', (req, res) => {
   for (const r of pending) {
     refundReservation(r, 'park', '设施拆除，园方强制退款')
   }
+  // 在途检修工单作废
+  cancelOrdersByRide(id)
   db.prepare('DELETE FROM rides WHERE id=?').run(id)
   res.json({ ok: true })
 })
@@ -835,7 +882,11 @@ app.post('/api/staff/:id', (req, res) => {
   const id = num(req.params.id)
   const b = req.body || {}
   if (b.zone_id) db.prepare('UPDATE staff SET zone_id=? WHERE id=?').run(num(b.zone_id), id)
-  if (b.active !== undefined) db.prepare('UPDATE staff SET active=? WHERE id=?').run(b.active ? 1 : 0, id)
+  if (b.active !== undefined) {
+    db.prepare('UPDATE staff SET active=? WHERE id=?').run(b.active ? 1 : 0, id)
+    // 维修工离岗：在修工单退回排队、进度保留，等待其他维修工接续
+    if (!b.active) releaseStaffOrders(id)
+  }
   if (b.assignRide) db.prepare('UPDATE staff SET assigned_ride_id=? WHERE id=?').run(num(b.assignRide), id)
   if (b.assignVendor) db.prepare('UPDATE staff SET assigned_ride_id=? WHERE id=?').run(num(b.assignVendor), id)
   res.json({ ok: true })
@@ -1012,6 +1063,35 @@ app.get('/api/complaints/:id', (req, res) => {
   if (!c) return res.status(404).json({ ok: false })
   const logs = db.prepare('SELECT * FROM complaint_logs WHERE complaint_id=? ORDER BY id').all(c.id)
   res.json({ complaint: enrichComplaints([c])[0], logs })
+})
+
+// ---- 设施检修工单 ----
+// 工单列表（默认全部，可按状态过滤）
+app.get('/api/maintenance', (req, res) => {
+  const q = req.query || {}
+  res.json({
+    list: listMaintenanceOrders({ status: q.status || null, limit: 200 }),
+    stats: maintenanceStats()
+  })
+})
+
+// 工单详情 + 处理时间线
+app.get('/api/maintenance/:id', (req, res) => {
+  const detail = maintenanceOrderDetail(num(req.params.id))
+  if (!detail) return res.status(404).json({ ok: false })
+  res.json(detail)
+})
+
+// 接单 / 转派（仅在岗维修员工，每人同时只接一个在修工单）
+app.post('/api/maintenance/:id/assign', (req, res) => {
+  const r = assignMaintenanceOrder(num(req.params.id), num(req.body?.staff_id))
+  res.status(r.ok ? 200 : 400).json(r)
+})
+
+// 撤销排队中（未接单）的工单，设施恢复运营
+app.post('/api/maintenance/:id/cancel', (req, res) => {
+  const r = cancelMaintenanceOrder(num(req.params.id))
+  res.status(r.ok ? 200 : 400).json(r)
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----
