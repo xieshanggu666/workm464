@@ -408,6 +408,136 @@ function complaintStats() {
   return { open, overdue, todayClosed, resolved, total, avgRating: Math.round(avgRating * 10) / 10, compTotal }
 }
 
+// ---------------- 设施维修工单 ----------------
+// 报修即停运并生成工单排队；维修员接单后按游戏时间推进进度；
+// 支持排队 / 转派 / 离岗接续；完工结算费用入账并恢复运营与可售时段
+const REPAIR_BASE_COST = 2000        // 基础检修费
+const REPAIR_HEALTH_COST = 80        // 每点待修复健康度费用
+const REPAIR_RATE_BASE = 14          // 基础进度 / 游戏小时
+const REPAIR_RATE_SKILL = 9          // 每级技能加成
+const REPAIR_DISPATCH_DELAY = 2      // 排队超过 N 小时未手动指派则自动派单
+const REPAIR_ACTIVE = ['queued', 'processing']
+
+const activeRepairOrder = rideId =>
+  db.prepare(`SELECT * FROM repair_orders WHERE ride_id=? AND status IN ('queued','processing')`).get(rideId)
+
+function logRepair(oid, action, note, staffId = null) {
+  db.prepare('INSERT INTO repair_logs(order_id,tick,day,hour,action,note,staff_id) VALUES(?,?,?,?,?,?,?)')
+    .run(oid, state.tick(), state.day(), state.hour(), action, note || '', staffId)
+}
+
+// 完工维修费：按报修时健康度锁定（修得越烂越贵）
+const repairCost = healthFrom => Math.round(REPAIR_BASE_COST + Math.max(0, 100 - healthFrom) * REPAIR_HEALTH_COST)
+// 维修速度：技能与士气决定每小时进度
+const repairRate = st => REPAIR_RATE_BASE + st.skill * REPAIR_RATE_SKILL + st.morale / 25
+
+// 创建维修工单：设施转检修停运，联动分时预约关停时段、在途预约园方全额退款（生成投诉）
+function createRepairOrder(ride, source = 'manual') {
+  if (!ride) return { ok: false, msg: '设施不存在' }
+  const exist = activeRepairOrder(ride.id)
+  if (exist) return { ok: false, msg: `已有进行中的工单 ${exist.code}，完工后才能再次报修` }
+  if (ride.status === 'closed') return { ok: false, msg: '设施已关闭，请先开放再报修' }
+  const r = db.prepare(`INSERT INTO repair_orders(code,ride_id,ride_name,status,health_from,source,created_tick,created_day,queued_tick)
+                        VALUES(?,?,?,'queued',?,?,?,?,?)`)
+    .run('', ride.id, ride.name, ride.health, source, state.tick(), state.day(), state.tick())
+  const id = Number(r.lastInsertRowid)
+  const code = 'WX' + String(id).padStart(4, '0')
+  db.prepare('UPDATE repair_orders SET code=? WHERE id=?').run(code, id)
+  if (ride.status !== 'maintenance') db.prepare("UPDATE rides SET status='maintenance' WHERE id=?").run(ride.id)
+  // 停运联动：关停未来可售时段，在途预约园方全额退款并生成投诉工单
+  syncRideSlots({ ...ride, status: 'maintenance' })
+  logRepair(id, 'create',
+    source === 'auto' ? `健康度跌至 ${Math.round(ride.health)}，故障自动停运，生成维修工单`
+    : source === 'legacy' ? '存量检修状态迁移，补建维修工单'
+    : `运营手动报修（健康度 ${Math.round(ride.health)}），设施停运待修`)
+  return { ok: true, id, code }
+}
+
+// 维修工单主循环（每游戏小时）：离岗退回 → 自动派单 → 推进进度 / 完工结算。返回本时段维修支出
+function processRepairs() {
+  const tickN = state.tick()
+  let spend = 0
+
+  // 1) 离岗接续：接单维修员离岗（解雇）→ 工单退回排队，进度保留，等待他人接手
+  for (const o of db.prepare("SELECT * FROM repair_orders WHERE status='processing'").all()) {
+    const st = o.assignee_id ? db.prepare('SELECT * FROM staff WHERE id=?').get(o.assignee_id) : null
+    if (!st || !st.active) {
+      db.prepare("UPDATE repair_orders SET status='queued', assignee_id=NULL, queued_tick=? WHERE id=?").run(tickN, o.id)
+      logRepair(o.id, 'unassign', `维修员${st ? ' ' + st.name : ''}离岗，工单退回排队（进度 ${Math.round(o.progress)}% 保留）`, o.assignee_id)
+    }
+  }
+
+  // 2) 自动派单：排队超过宽限时长仍未手动指派的工单，派给空闲维修员（技能/士气高者优先，一人一单）
+  const queued = db.prepare('SELECT * FROM repair_orders WHERE status=? AND ?-queued_tick>=? ORDER BY id')
+    .all('queued', tickN, REPAIR_DISPATCH_DELAY)
+  if (queued.length) {
+    const idle = db.prepare(`SELECT * FROM staff WHERE role='维修' AND active=1
+      AND id NOT IN (SELECT assignee_id FROM repair_orders WHERE status='processing' AND assignee_id IS NOT NULL)
+      ORDER BY skill DESC, morale DESC`).all()
+    for (const o of queued) {
+      const st = idle.shift()
+      if (!st) break
+      db.prepare("UPDATE repair_orders SET status='processing', assignee_id=?, accepted_tick=? WHERE id=?").run(st.id, tickN, o.id)
+      logRepair(o.id, 'auto_assign', `自动派单：${st.name}（Lv.${st.skill}）接单`, st.id)
+    }
+  }
+
+  // 3) 推进维修进度；完工：健康度恢复 100、设施恢复运营、维修费入账、可售时段重新开放
+  for (const o of db.prepare("SELECT * FROM repair_orders WHERE status='processing'").all()) {
+    const st = o.assignee_id ? db.prepare('SELECT * FROM staff WHERE id=?').get(o.assignee_id) : null
+    if (!st) continue
+    const progress = o.progress + repairRate(st)
+    if (progress < 100) {
+      db.prepare('UPDATE repair_orders SET progress=? WHERE id=?').run(Math.round(progress * 10) / 10, o.id)
+      continue
+    }
+    const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(o.ride_id)
+    const cost = repairCost(o.health_from)
+    db.prepare("UPDATE repair_orders SET status='done', progress=100, cost=?, done_tick=?, done_day=? WHERE id=?")
+      .run(cost, tickN, state.day(), o.id)
+    if (ride) {
+      db.prepare("UPDATE rides SET health=100, status='operating', queue=0 WHERE id=?").run(ride.id)
+      syncRideSlots({ ...ride, health: 100, status: 'operating' })   // 恢复未来可售时段
+    }
+    spend += cost
+    logFinance(state.day(), '维护', -cost, `维修工单 ${o.code}「${o.ride_name}」完工结算`)
+    db.prepare('UPDATE staff SET morale=? WHERE id=?').run(Math.min(100, st.morale + 3), st.id)
+    logRepair(o.id, 'done', `完工：健康度恢复 100，设施恢复运营并重新开放预约时段；维修费 ¥${cost.toLocaleString()} 入账`, st.id)
+  }
+  return spend
+}
+
+function enrichRepairOrders(rows) {
+  const rides = allRides()
+  return rows.map(o => {
+    const ride = rides.find(r => r.id === o.ride_id)
+    const st = o.assignee_id ? db.prepare('SELECT id,name,skill,morale FROM staff WHERE id=?').get(o.assignee_id) : null
+    const rate = st ? repairRate(st) : 0
+    return {
+      ...o,
+      ride_name: ride?.name || o.ride_name,
+      ride_type: ride?.type || '',
+      ride_status: ride?.status || '',
+      assignee_name: st?.name || '',
+      assignee_skill: st?.skill ?? null,
+      est_cost: o.status === 'done' ? o.cost : repairCost(o.health_from),
+      eta_hours: o.status === 'processing' && rate > 0 ? Math.ceil((100 - o.progress) / rate) : null,
+      queued_hours: o.status === 'queued' ? Math.max(0, state.tick() - o.queued_tick) : 0
+    }
+  })
+}
+
+function repairStats() {
+  const one = (sql, ...args) => db.prepare(sql).get(...args).n
+  return {
+    queued: one("SELECT COUNT(*) n FROM repair_orders WHERE status='queued'"),
+    processing: one("SELECT COUNT(*) n FROM repair_orders WHERE status='processing'"),
+    doneToday: one("SELECT COUNT(*) n FROM repair_orders WHERE status='done' AND done_day=?", state.day()),
+    totalCost: db.prepare("SELECT COALESCE(SUM(cost),0) n FROM repair_orders WHERE status='done'").get().n,
+    downRides: db.prepare("SELECT COUNT(*) n FROM rides WHERE status='maintenance'").get().n
+  }
+}
+
 // ---------------- 游戏主循环 ----------------
 function tick() {
   let day = state.day()
@@ -557,6 +687,9 @@ function tick() {
   // 投诉处置：推进受理进度，超时自动升级 / 公开差评，返回本时段声誉扣分
   const complaintPenalty = processComplaints()
 
+  // 维修工单：离岗退回 / 自动派单 / 按游戏时间推进进度，完工结算维修费
+  cash -= processRepairs()
+
   // 声誉演化：满意度+事件+预算健康度+超时投诉
   const budgetHealth = cash > 0 ? Math.min(1, cash / 200000) : -0.4
   rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift - complaintPenalty))
@@ -632,17 +765,24 @@ function maybeSpawnEvent(day) {
 }
 
 function checkBrokenDown(day) {
+  // 健康度过低 → 故障自动停运并生成维修工单（排队等待维修员接单，不再即时修复）
   const bad = db.prepare("SELECT * FROM rides WHERE health<25 AND status='operating'").all()
   for (const r of bad) {
-    db.prepare("UPDATE rides SET status='maintenance' WHERE id=?").run(r.id)
-    // 停运联动：关闭未来时段并对在途预约园方全额退款（生成投诉）
-    syncRideSlots({ ...r, status: 'maintenance' })
+    const ro = createRepairOrder(r, 'auto')
+    if (ro.ok) {
+      db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+        .run(state.tick(), day, 'fault', '设备故障停运', `「${r.name}」健康度过低已自动停运，生成维修工单 ${ro.code}，等待维修员接单。`, -1, 'active')
+    }
   }
-  const sound = db.prepare("SELECT * FROM rides WHERE health>95 AND status='maintenance'").all()
-  for (const r of sound) {
-    db.prepare("UPDATE rides SET status='operating' WHERE id=?").run(r.id)
-    syncRideSlots({ ...r, status: 'operating' })
-  }
+  // 兜底：检修中但无工单的存量设施 → 补建工单（兼容旧版检修状态，完工后才会恢复运营）
+  const orphan = db.prepare(`SELECT * FROM rides WHERE status='maintenance'
+    AND id NOT IN (SELECT ride_id FROM repair_orders WHERE status IN ('queued','processing'))`).all()
+  for (const r of orphan) createRepairOrder(r, 'legacy')
+}
+
+// 启动时迁移：旧版即时检修留下的 maintenance 设施统一补建工单（幂等）
+for (const r of db.prepare("SELECT * FROM rides WHERE status='maintenance'").all()) {
+  createRepairOrder(r, 'legacy')
 }
 
 // 启动循环
@@ -686,6 +826,8 @@ app.get('/api/state', (req, res) => {
     events: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 40').all(),
     complaints: enrichComplaints(db.prepare('SELECT * FROM complaints ORDER BY id DESC LIMIT 60').all()),
     complaintStats: complaintStats(),
+    repairs: enrichRepairOrders(db.prepare('SELECT * FROM repair_orders ORDER BY id DESC LIMIT 40').all()),
+    repairStats: repairStats(),
     wordOfMouth: state.wordOfMouth(),
     reservationStats: reservationStats(),
     entrySlots: listSlots({ scope: 'entry' }),
@@ -735,6 +877,17 @@ app.post('/api/rides', (req, res) => {
 app.post('/api/rides/:id', (req, res) => {
   const id = num(req.params.id)
   const b = req.body || {}
+  // 兼容旧版即时检修调用：转为创建维修工单（排队 → 接单 → 按游戏时间推进）
+  if (b.repair) {
+    const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
+    const r = createRepairOrder(ride, 'manual')
+    return res.status(r.ok ? 200 : 400).json(r)
+  }
+  // 工单流转期间锁定设施状态切换（完工后自动恢复运营）
+  if (b.status) {
+    const active = activeRepairOrder(id)
+    if (active) return res.status(400).json({ ok: false, msg: `设施检修中（工单 ${active.code}），完工后自动恢复运营` })
+  }
   const sets = []
   const vals = []
   if (b.status) { sets.push('status=?'); vals.push(b.status) }
@@ -751,14 +904,6 @@ app.post('/api/rides/:id', (req, res) => {
     setSetting('cash', Math.round(cash))
     logFinance(state.day(), '升级', -cost, `升级设施 #${id}`)
   }
-  if (b.repair) {
-    sets.push("health=? , status='operating'"); vals.push(100)
-    let cash = state.cash()
-    const cost = 5000
-    cash -= cost
-    setSetting('cash', Math.round(cash))
-    logFinance(state.day(), '维护', -cost, `检修设施 #${id}`)
-  }
   if (!sets.length) return res.json({ ok: false, msg: '无更新项' })
   vals.push(id)
   db.prepare(`UPDATE rides SET ${sets.join(',')} WHERE id=?`).run(...vals)
@@ -767,11 +912,15 @@ app.post('/api/rides/:id', (req, res) => {
     const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
     syncRideSlots(ride)
   }
-  if (b.repair) {
-    const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(id)
-    syncRideSlots(ride)
-  }
   res.json({ ok: true })
+})
+
+// 手动报修：设施停运并生成维修工单（进入排队，等待维修员接单）
+app.post('/api/rides/:id/repair', (req, res) => {
+  const ride = db.prepare('SELECT * FROM rides WHERE id=?').get(num(req.params.id))
+  if (!ride) return res.status(404).json({ ok: false, msg: '设施不存在' })
+  const r = createRepairOrder(ride, 'manual')
+  res.status(r.ok ? 200 : 400).json(r)
 })
 
 app.delete('/api/rides/:id', (req, res) => {
@@ -781,8 +930,59 @@ app.delete('/api/rides/:id', (req, res) => {
   for (const r of pending) {
     refundReservation(r, 'park', '设施拆除，园方强制退款')
   }
+  // 未完工的维修工单随拆除取消（不计费用）
+  for (const o of db.prepare("SELECT * FROM repair_orders WHERE ride_id=? AND status IN ('queued','processing')").all(id)) {
+    db.prepare("UPDATE repair_orders SET status='cancelled' WHERE id=?").run(o.id)
+    logRepair(o.id, 'cancel', '设施拆除，工单取消')
+  }
   db.prepare('DELETE FROM rides WHERE id=?').run(id)
   res.json({ ok: true })
+})
+
+// ---- 设施维修工单 ----
+app.get('/api/repairs', (req, res) => {
+  const rows = db.prepare('SELECT * FROM repair_orders ORDER BY id DESC LIMIT 120').all()
+  res.json({ list: enrichRepairOrders(rows), stats: repairStats() })
+})
+
+// 指派 / 转派维修员接单（进度保留，仅维修岗可接，一人一单）
+app.post('/api/repairs/:id/assign', (req, res) => {
+  const id = num(req.params.id)
+  const o = db.prepare('SELECT * FROM repair_orders WHERE id=?').get(id)
+  if (!o || !REPAIR_ACTIVE.includes(o.status)) return res.status(400).json({ ok: false, msg: '工单不存在或已完工' })
+  const st = db.prepare('SELECT * FROM staff WHERE id=? AND active=1').get(num(req.body?.staff_id))
+  if (!st) return res.status(400).json({ ok: false, msg: '员工不存在或已离岗' })
+  if (st.role !== '维修') return res.status(400).json({ ok: false, msg: '仅维修岗位员工可接维修工单' })
+  if (o.assignee_id === st.id) return res.status(400).json({ ok: false, msg: '该员工已接手此工单' })
+  const busy = db.prepare("SELECT code FROM repair_orders WHERE assignee_id=? AND status='processing'").get(st.id)
+  if (busy) return res.status(400).json({ ok: false, msg: `${st.name} 正在处理 ${busy.code}，每人同时只能修一台` })
+  const reassign = o.status === 'processing' && o.assignee_id
+  const from = reassign ? db.prepare('SELECT name FROM staff WHERE id=?').get(o.assignee_id)?.name : null
+  db.prepare("UPDATE repair_orders SET status='processing', assignee_id=?, accepted_tick=? WHERE id=?")
+    .run(st.id, o.status === 'queued' ? state.tick() : o.accepted_tick, id)
+  logRepair(id, reassign ? 'reassign' : 'assign',
+    reassign ? `转派：${from || '原维修员'} → ${st.name}（Lv.${st.skill}），进度 ${Math.round(o.progress)}% 保留`
+             : `指派 ${st.name}（Lv.${st.skill}）接单`, st.id)
+  res.json({ ok: true })
+})
+
+// 退回排队：工单重新排队等待接单（进度保留）
+app.post('/api/repairs/:id/unassign', (req, res) => {
+  const id = num(req.params.id)
+  const o = db.prepare('SELECT * FROM repair_orders WHERE id=?').get(id)
+  if (!o || o.status !== 'processing') return res.status(400).json({ ok: false, msg: '工单不存在或不在维修中' })
+  const st = o.assignee_id ? db.prepare('SELECT name FROM staff WHERE id=?').get(o.assignee_id) : null
+  db.prepare("UPDATE repair_orders SET status='queued', assignee_id=NULL, queued_tick=? WHERE id=?").run(state.tick(), id)
+  logRepair(id, 'unassign', `${st?.name || '维修员'}退回工单，进度 ${Math.round(o.progress)}% 保留，重新排队`, o.assignee_id)
+  res.json({ ok: true })
+})
+
+// 工单详情 + 处理时间线
+app.get('/api/repairs/:id', (req, res) => {
+  const o = db.prepare('SELECT * FROM repair_orders WHERE id=?').get(num(req.params.id))
+  if (!o) return res.status(404).json({ ok: false })
+  const logs = db.prepare('SELECT * FROM repair_logs WHERE order_id=? ORDER BY id').all(o.id)
+  res.json({ order: enrichRepairOrders([o])[0], logs })
 })
 
 // ---- 商铺 ----

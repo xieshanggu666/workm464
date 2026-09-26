@@ -61,6 +61,7 @@ onMounted(store.refresh)
           <span class="halo" v-if="store.activeEvents.length">{{ store.activeEvents.length }} 个待处理事件</span>
           <span class="halo red" v-if="store.complaintStats.open">{{ store.complaintStats.open }} 条投诉待处置</span>
           <span class="halo" v-if="store.reservationStats.oversoldPending">⚠️ {{ store.reservationStats.oversoldPending }} 个超售时段待消化</span>
+          <span class="halo repair-halo" v-if="store.repairStats.queued || store.repairStats.processing" @click="view = 'rides'">🛠️ 维修 {{ store.repairStats.queued }} 排队 / {{ store.repairStats.processing }} 维修中</span>
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
@@ -112,6 +113,7 @@ main { flex: 1; min-width: 0; }
 .topbar .la { display: flex; align-items: center; gap: 12px; }
 .halo { font-size: 12px; background: rgba(255,209,102,.2); color: var(--accent2); border: 1px solid rgba(255,209,102,.4); padding: 2px 10px; border-radius: 20px; }
 .halo.red { background: rgba(255,107,107,.18); color: var(--red); border-color: rgba(255,107,107,.45); }
+.halo.repair-halo { cursor: pointer; background: rgba(102,166,255,.15); color: var(--blue); border-color: rgba(102,166,255,.4); }
 .stats { display: flex; gap: 12px; flex-wrap: wrap; }
 .pill { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
 .pill b { color: var(--text); margin-left: 4px; }

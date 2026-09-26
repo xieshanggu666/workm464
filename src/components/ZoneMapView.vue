@@ -26,6 +26,10 @@ const grid = computed(() => {
 
 const selRide = computed(() => selected.value ? store.rides.find(r => r.id === selected.value.r && selected.value.k === 'ride') : null)
 const selVendor = computed(() => selected.value ? store.vendors.find(v => v.id === selected.value.r && selected.value.k === 'vendor') : null)
+// 选中设施的进行中维修工单
+const selRideOrder = computed(() => selRide.value
+  ? store.repairs.find(o => ['queued', 'processing'].includes(o.status) && o.ride_id === selRide.value.id)
+  : null)
 </script>
 
 <template>
@@ -85,10 +89,13 @@ const selVendor = computed(() => selected.value ? store.vendors.find(v => v.id =
           <div><em class="muted">每日运营成本</em><b class="money neg">{{ selRide.run_cost }}</b></div>
         </div>
         <div class="acts">
-          <button :class="selRide.status==='operating'?'danger':''" @click="store.updateRide(selRide.id,{status: selRide.status==='operating'?'closed':'operating'})">
+          <button :class="selRide.status==='operating'?'danger':''" :disabled="!!selRideOrder"
+                  :title="selRideOrder ? '工单流转中，完工后自动恢复运营' : ''"
+                  @click="store.updateRide(selRide.id,{status: selRide.status==='operating'?'closed':'operating'})">
             {{ selRide.status === 'operating' ? '关闭' : '重新开放' }}
           </button>
-          <button v-if="selRide.status !== 'operating'" @click="store.updateRide(selRide.id,{repair:1})">检修(5千)</button>
+          <button v-if="!selRideOrder && selRide.status !== 'closed'" @click="store.createRepair(selRide.id)">报修</button>
+          <span class="tag" v-else-if="selRideOrder">工单 {{ selRideOrder.code }} · {{ Math.round(selRideOrder.progress) }}%</span>
           <button @click="store.updateRide(selRide.id,{upgrade:10})">升级刺激度(3万)</button>
           <button @click="store.delRide(selRide.id)">拆除</button>
           <button class="ghost" @click="selected=null">关闭</button>
@@ -141,5 +148,7 @@ const selVendor = computed(() => selected.value ? store.vendors.find(v => v.id =
 .mh div { background: var(--panel2); border-radius: 10px; padding: 10px 14px; flex: 1; min-width: 90px; text-align: center; }
 .mh em { display: block; font-style: normal; font-size: 11px; }
 .mh b { font-size: 20px; }
-.acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.acts { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.acts button:disabled { opacity: .45; cursor: not-allowed; }
+.acts .tag { font-size: 11px; color: var(--accent2); border: 1px solid rgba(255,209,102,.4); border-radius: 12px; padding: 4px 10px; }
 </style>

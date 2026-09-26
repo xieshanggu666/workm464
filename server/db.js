@@ -157,6 +157,39 @@ CREATE TABLE IF NOT EXISTS complaint_logs (
   staff_id INTEGER
 );
 
+-- 设施维修工单：报修即停运，维修员接单后按游戏时间推进，支持排队/转派/离岗接续
+CREATE TABLE IF NOT EXISTS repair_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL DEFAULT '',             -- 工单号 WX0001
+  ride_id INTEGER NOT NULL,
+  ride_name TEXT NOT NULL DEFAULT '',        -- 冗余设施名，拆除后仍可追溯
+  status TEXT NOT NULL DEFAULT 'queued',     -- queued 排队 / processing 维修中 / done 完工 / cancelled 取消
+  assignee_id INTEGER,                       -- 当前接单维修员
+  progress REAL NOT NULL DEFAULT 0,          -- 维修进度 0-100
+  health_from REAL NOT NULL DEFAULT 0,       -- 报修时健康度（锁定完工维修费用）
+  cost INTEGER NOT NULL DEFAULT 0,           -- 完工结算维修费
+  source TEXT NOT NULL DEFAULT 'manual',     -- manual 手动报修 / auto 故障自动 / legacy 存量检修迁移
+  created_tick INTEGER NOT NULL,
+  created_day INTEGER NOT NULL,
+  queued_tick INTEGER NOT NULL DEFAULT 0,    -- 最近一次进入排队的时刻（自动派单宽限计时）
+  accepted_tick INTEGER NOT NULL DEFAULT 0, -- 接单时刻
+  done_tick INTEGER NOT NULL DEFAULT 0,
+  done_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_repair_orders_status ON repair_orders(status);
+
+CREATE TABLE IF NOT EXISTS repair_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL,
+  tick INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  hour INTEGER NOT NULL,
+  action TEXT NOT NULL,                      -- create/assign/auto_assign/reassign/unassign/done/cancel
+  note TEXT NOT NULL DEFAULT '',
+  staff_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_repair_logs_oid ON repair_logs(order_id);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT

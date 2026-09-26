@@ -70,6 +70,10 @@ const repLabels = Array.from({ length: Math.min(store.visitors.length, 12) }, (_
       <div class="card stat" :class="{ alert: store.reservationStats.oversoldPending }">
         <span>⚠️</span><b :class="store.reservationStats.oversoldPending ? 'money neg' : ''">{{ store.reservationStats.oversoldPending }}</b><em>超售待消化</em>
       </div>
+      <div class="card stat" :class="{ alert: store.repairStats.queued }">
+        <span>🛠️</span><b :class="store.repairStats.queued ? 'money neg' : ''">{{ store.repairStats.queued }}/{{ store.repairStats.processing }}</b>
+        <em>维修工单 排队/维修中（停运 {{ store.repairStats.downRides }} 台）</em>
+      </div>
     </div>
 
     <div class="row">

@@ -16,6 +16,13 @@ const roleDesc = k => roles.find(r => r.k === k)?.desc
 
 const wageSum = computed(() => store.staff.filter(s => s.active).reduce((a, b) => a + b.wage, 0))
 
+// 员工 → 进行中的维修工单（维修岗）
+const orderByStaff = computed(() => {
+  const m = {}
+  for (const o of store.repairs) if (o.status === 'processing' && o.assignee_id) m[o.assignee_id] = o
+  return m
+})
+
 function hire() {
   const role = roles[Math.floor(Math.random() * 3)].k
   store.hire({ name: names[Math.floor(Math.random() * names.length)], role, zone_id: 1 })
@@ -40,7 +47,7 @@ function hire() {
 
     <div class="table card">
       <div class="thead">
-        <span>员工</span><span>岗位</span><span>区域</span><span>技能</span><span>满意度</span><span>日薪</span><span>状态</span><span>操作</span>
+        <span>员工</span><span>岗位</span><span>区域</span><span>技能</span><span>满意度</span><span>日薪</span><span>状态</span><span>当前工单</span><span>操作</span>
       </div>
       <div class="trow" v-for="s in store.staff" :key="s.id">
         <span><b>{{ s.name }}</b></span>
@@ -54,6 +61,14 @@ function hire() {
         <span><div class="hb"><i :style="{width:s.morale+'%',background:s.morale>60?'var(--green)':s.morale>40?'var(--accent2)':'var(--red)'}"></i></div>{{ s.morale }}</span>
         <span class="money neg">¥{{ s.wage }}</span>
         <span><i class="dot" :class="s.active?'on':'off'"></i>{{ s.active ? '在岗' : '已辞退' }}</span>
+        <span>
+          <template v-if="s.role === '维修'">
+            <em class="busy" v-if="orderByStaff[s.id]">{{ orderByStaff[s.id].code }} · {{ Math.round(orderByStaff[s.id].progress) }}%</em>
+            <em class="muted" v-else-if="s.active">空闲</em>
+            <em class="muted" v-else>—</em>
+          </template>
+          <em class="muted" v-else>—</em>
+        </span>
         <span>
           <button class="ghost" @click="s.active ? store.updateStaff(s.id,{active:0}) : store.updateStaff(s.id,{active:1})">{{ s.active ? '解雇' : '返聘' }}</button>
         </span>
@@ -72,7 +87,7 @@ function hire() {
 .role-intro .big-ic { font-size: 26px; }
 .role-intro em { font-style: normal; font-size: 12px; margin-left: auto; text-align: right; }
 .table { padding: 6px; overflow-x: auto; }
-.thead, .trow { display: grid; grid-template-columns: 1fr 1.2fr 1.4fr .6fr 1fr .7fr .8fr .8fr; gap: 8px; align-items: center; padding: 10px 12px; font-size: 13px; min-width: 760px; }
+.thead, .trow { display: grid; grid-template-columns: 1fr 1.2fr 1.4fr .6fr 1fr .7fr .8fr 1fr .8fr; gap: 8px; align-items: center; padding: 10px 12px; font-size: 13px; min-width: 860px; }
 .thead { color: var(--muted); border-bottom: 1px solid var(--border); font-size: 12px; }
 .trow { border-bottom: 1px solid var(--border); }
 .trow:last-child { border-bottom: none; }
@@ -81,5 +96,6 @@ function hire() {
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
 .dot.on { background: var(--green); }
 .dot.off { background: var(--red); }
+.busy { font-style: normal; font-size: 12px; color: var(--blue); }
 .empty { padding: 16px; text-align: center; }
 </style>
